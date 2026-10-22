@@ -1,0 +1,120 @@
+# Secrets come from the git-ignored .env file next to this one (Compose reads it for ${…}
+# interpolation). Only the variables listed under `environment` reach a container.
+services:
+  # The primary PostgreSQL 18 server (official image + the pgvector extension). Every demo
+  # runs real SQL here. Not published to the host: use `docker exec -it postgres-lab-db psql -U lab`.
+  db:
+    image: pgvector/pgvector:0.8.7-pg18-trixie
+    container_name: postgres-lab-db
+    restart: unless-stopped
+    shm_size: 256m
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_DB: lab
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lab-local-only}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replica-local-only}
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - max_connections=120
+      - -c
+      - wal_level=replica
+      - -c
+      - wal_keep_size=256MB
+      - -c
+      - log_lock_waits=on
+      - -c
+      - shared_buffers=256MB
+    volumes:
+      # Postgres 18+ images keep data in /var/lib/postgresql/18/docker: mount the parent
+      - pgdata:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # A hot-standby replica fed by streaming replication: read-only, a few ms behind.
+  replica:
+    image: pgvector/pgvector:0.8.7-pg18-trixie
+    container_name: postgres-lab-replica
+    restart: unless-stopped
+    user: postgres
+    entrypoint: ["/replica/start-replica.sh"]
+    environment:
+      PRIMARY_HOST: db
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replica-local-only}
+    volumes:
+      - replicadata:/var/lib/postgresql
+      - ./db/replica:/replica:ro
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  backend:
+    build:
+      context: ./backend
+      target: runtime
+    container_name: postgres-lab-backend
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: lab
+      PGDATABASE: lab
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lab-local-only}
+      REPLICA_HOST: replica
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  # Production build served by nginx on :80. The container name and tunnel-net match the
+  # Cloudflare tunnel route (http://rixus-frontend:80), so pipeline-run.sh can publish it.
+  frontend:
+    build:
+      context: ./frontend
+      target: runtime
+    container_name: rixus-frontend
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - default
+      - tunnel-net
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  replicadata:
+
+networks:
+  tunnel-net:
+    external: true

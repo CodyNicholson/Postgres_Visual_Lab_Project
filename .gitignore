@@ -1,0 +1,21 @@
+# Secrets and local deploy script
+.env
+.env.*
+!.env.example
+pipeline-run.sh
+
+# Build output and dependencies
+node_modules/
+dist/
+target/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.angular/
+
+# Editors and logs
+.idea/
+*.iml
+.vscode/
+claude_logs/
