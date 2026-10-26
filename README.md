@@ -22,8 +22,8 @@ exact error text Postgres 18.6 prints, 63 of which you can reproduce with one cl
 ## Quick start
 
 ```bash
-docker network create tunnel-net        # once; docker-compose.yml expects it
-cp .env.example .env                    # optional: passwords default to local-only values
+docker network create tunnel-net        # once; the compose file joins this external network
+cp .env.example .env                    # then set POSTGRES_PASSWORD and REPLICATION_PASSWORD (openssl rand -hex 24)
 docker compose up -d --build
 open http://localhost:3000
 ```
@@ -36,7 +36,7 @@ food embeddings) in a few seconds.
 | `db` | `postgres-lab-db` | – (internal 5432) | `pgvector/pgvector:0.8.7-pg18-trixie` = PostgreSQL 18.6 + pgvector; `pg_stat_statements` preloaded. `docker exec -it postgres-lab-db psql -U lab` |
 | `replica` | `postgres-lab-replica` | – | Hot standby cloned with `pg_basebackup`, streaming from `db` |
 | `backend` | `postgres-lab-backend` | 8000 | FastAPI + psycopg 3.3 + psycopg_pool, pg_dump/pg_restore 18 |
-| `frontend` | `rixus-frontend` | 3000 → 80 | nginx serving the React build, proxies `/api/` |
+| `frontend` | – | 3000 → 80 | unprivileged nginx serving the React build, proxies `/api/` |
 
 ## Feature coverage
 
@@ -90,7 +90,7 @@ food embeddings) in a few seconds.
 Browser (React + Vite)
    │  POST /api/demos/<feature>
    ▼
-rixus-frontend (nginx :80) ── /api/ ──► backend (FastAPI :8000, psycopg 3 + pool, pg_dump 18)
+frontend (nginx :80) ────── /api/ ──► backend (FastAPI :8000, psycopg 3 + pool, pg_dump 18)
                                            │  every run gets a private scratch schema
                                            │  run_<demo>_<hex>, dropped afterwards
                                            ▼
@@ -160,11 +160,16 @@ IMMUTABLE" index check; reading a full page triggers opportunistic pruning of de
 
 | Variable | Purpose |
 |---|---|
-| `TUNNEL_TOKEN` | Cloudflare tunnel token for `pipeline-run.sh` (only if not set globally) |
-| `POSTGRES_PASSWORD` | password of the `lab` superuser; empty = local-only default. Applied only when the volume is first created |
+| `POSTGRES_PASSWORD` | password of the `lab` superuser; required (no fallback). Applied only when the volume is first created |
 | `REPLICATION_PASSWORD` | password of the `replicator` role the replica uses (same rules) |
 
-The database ports are not published; only the UI (3000) and API (8000) are.
+The database ports are not published; only the UI (3000) and API (8000) are, on `127.0.0.1` only (Docker's
+iptables rules bypass `ufw`, so a bare `3000:80` would be reachable from outside).
+The primary and replica sit on the internal `backend-net`, which the public nginx container cannot reach.
+nginx runs unprivileged (uid 101) with all capabilities dropped, `no-new-privileges`, and memory,
+CPU and process limits; the other containers have `no-new-privileges` and memory and process limits.
+Every response carries `Content-Security-Policy` (same-origin only, no framing), `X-Content-Type-Options`,
+`Referrer-Policy` and `Permissions-Policy` (`frontend/security-headers.conf`); the nginx version is hidden.
 
 ## Safety on the public site
 
@@ -182,18 +187,18 @@ small semaphore. The SQL-injection demo only concatenates three prepared payload
 | Backend unit tests (image build, no DB) | `docker build --target test backend` | 2 passed, 89 skipped (need a DB) |
 | Backend suite against the real stack: every demo and every "Do it wrong" mode | see below | 75 passed, 16 skipped (demos without a mistake mode) |
 | Frontend (Vitest): catalog completeness, every page renders, every visual renders with real captured results | `docker build --target test frontend` | 300 passed |
-| Isolated stack smoke test through nginx (UI, health, all 44 demos) | `bash ~/.claude/skills/visual-lab/scripts/test-isolated.sh .` | 46/46 ok |
+| Isolated stack smoke test through nginx (UI, health, all 44 demos) | isolated stack below, then GET `/`, `/api/health` and each demo's self-test | 46/46 ok |
 | In-browser "Run all demos" (headless Chromium) | `#suite` page | 44 ✓, 0 ✗ |
 
 Backend suite against the isolated stack:
 
 ```bash
-bash ~/.claude/skills/visual-lab/scripts/test-isolated.sh . up
+docker compose -p postgres-visual-lab-project-test -f docker-compose.yml -f docker-compose.test.yml up -d --build
 docker build --target test -t postgres-lab-backend-test backend
-docker run --rm --network postgres-visual-lab-project-test_default \
-  -e PGHOST=db -e PGUSER=lab -e PGDATABASE=lab -e PGPASSWORD=lab-local-only -e REPLICA_HOST=replica \
+docker run --rm --network postgres-visual-lab-project-test_backend-net \
+  -e PGHOST=db -e PGUSER=lab -e PGDATABASE=lab -e PGPASSWORD="$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2-)" -e REPLICA_HOST=replica \
   postgres-lab-backend-test python -m pytest -q
-bash ~/.claude/skills/visual-lab/scripts/test-isolated.sh . down
+docker compose -p postgres-visual-lab-project-test -f docker-compose.yml -f docker-compose.test.yml down -v
 ```
 
 Refresh the frontend's real-result fixtures after changing a demo's data shape:
@@ -203,18 +208,12 @@ Refresh the frontend's real-result fixtures after changing a demo's data shape:
 
 ```bash
 docker compose up -d db replica backend
-cd frontend && npm ci && npm run dev      # http://localhost:3000, proxies /api to :8000
+cd frontend && npm ci && npm run dev      # http://localhost:3000 (localhost only), proxies /api to :8000
 ```
 
 Backend code lives in `backend/app/demos/<category>.py` (one router per category);
 `backend/app/db.py` has the recorder (`run`, `fail`) and scratch-schema helpers. Frontend demo
 content lives in `frontend/src/demos/<category>.js`, visuals in `frontend/src/visuals/`.
-
-## Deployment
-
-`./pipeline-run.sh` (git-ignored) creates `.env` if missing, pulls, **removes all containers on
-the host**, starts the Cloudflare tunnel on `tunnel-net` and runs `docker compose up -d --build`.
-The tunnel routes to `http://rixus-frontend:80`, so this lab replaces whichever lab is live.
 
 ## Notes and limits
 

@@ -11,8 +11,8 @@ services:
     environment:
       POSTGRES_USER: lab
       POSTGRES_DB: lab
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lab-local-only}
-      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replica-local-only}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?Set REPLICATION_PASSWORD in .env}
     command:
       - postgres
       - -c
@@ -35,7 +35,10 @@ services:
       - ./db/init:/docker-entrypoint-initdb.d:ro
     security_opt:
       - no-new-privileges:true
+    pids_limit: 512
     mem_limit: 1g
+    networks:
+      - backend-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
       interval: 5s
@@ -51,16 +54,19 @@ services:
     entrypoint: ["/replica/start-replica.sh"]
     environment:
       PRIMARY_HOST: db
-      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replica-local-only}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?Set REPLICATION_PASSWORD in .env}
     volumes:
       - replicadata:/var/lib/postgresql
       - ./db/replica:/replica:ro
     security_opt:
       - no-new-privileges:true
+    pids_limit: 256
     mem_limit: 512m
     depends_on:
       db:
         condition: service_healthy
+    networks:
+      - backend-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
       interval: 5s
@@ -73,38 +79,49 @@ services:
       target: runtime
     container_name: postgres-lab-backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     restart: unless-stopped
     environment:
       PGHOST: db
       PGPORT: "5432"
       PGUSER: lab
       PGDATABASE: lab
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lab-local-only}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       REPLICA_HOST: replica
     security_opt:
       - no-new-privileges:true
+    mem_limit: 1g
+    pids_limit: 256
+    cap_drop:
+      - ALL
     depends_on:
       db:
         condition: service_healthy
+    networks:
+      - default
+      - backend-net
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')\""]
       interval: 10s
       timeout: 5s
       retries: 18
 
-  # Production build served by nginx on :80. The container name and tunnel-net match the
-  # Cloudflare tunnel route (http://rixus-frontend:80), so pipeline-run.sh can publish it.
+  # Production build served by unprivileged nginx on :80
   frontend:
     build:
       context: ./frontend
       target: runtime
     container_name: rixus-frontend
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:80"
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 100
     networks:
       - default
       - tunnel-net
@@ -116,5 +133,8 @@ volumes:
   replicadata:
 
 networks:
+  # Primary, replica and the backend. internal: no route out, unreachable from the public nginx.
+  backend-net:
+    internal: true
   tunnel-net:
     external: true
